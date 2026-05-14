@@ -1,0 +1,56 @@
+{
+  "name": "options-backtest",
+  "description": "Auto-validate India options predictions against historical data before executing trades",
+  "events": {
+    "PreToolUse": {
+      "toolName": "run_in_terminal",
+      "condition": "command contains 'streamlit run' OR command contains 'python app.py'",
+      "actions": [
+        {
+          "name": "run_accuracy_tests",
+          "command": "python .github/hooks/validate_predictions.py --instrument NIFTY --lookback 30 --min_accuracy 0.60",
+          "timeout": 60000,
+          "onFailure": "warn",
+          "message": "⚠️ Backtest accuracy < 60%. Review strategy before trading live."
+        }
+      ]
+    },
+    "PostToolUse": {
+      "toolName": "run_in_terminal",
+      "condition": "command contains 'python analytics/predictor.py'",
+      "actions": [
+        {
+          "name": "validate_greeks",
+          "command": "python .github/hooks/validate_greeks.py --sample_size 100",
+          "timeout": 30000,
+          "onFailure": "warn",
+          "message": "⚠️ Greeks validation failed. Check IV inputs."
+        },
+        {
+          "name": "test_sentiment_accuracy",
+          "command": "python .github/hooks/validate_sentiment.py --articles_required 3",
+          "timeout": 20000,
+          "onFailure": "info",
+          "message": "ℹ️ Sentiment API returned insufficient articles."
+        }
+      ]
+    }
+  },
+  "validationRules": {
+    "predictorAccuracy": {
+      "minThreshold": 0.60,
+      "lookbackDays": 30,
+      "instruments": ["SENSEX", "NIFTY", "BANKNIFTY", "GOLD", "SILVER"]
+    },
+    "greeksValidation": {
+      "deltaRange": [0, 1],
+      "ivRange": [0.05, 1.0],
+      "testSampleSize": 100
+    },
+    "sentimentCheck": {
+      "minConfidence": 0.5,
+      "minArticleCount": 2,
+      "maxAge": 24
+    }
+  }
+}
