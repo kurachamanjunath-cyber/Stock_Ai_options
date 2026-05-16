@@ -129,7 +129,7 @@ with st.sidebar:
             value=True,
             help="Polls global futures data every second for real-time international prices."
         )
-        st.info("📌 **GLOBAL DATA**: Using enhanced yfinance for real-time futures data.")
+        st.info("📌 **GLOBAL DATA**: Using Investing.com commodities first with yfinance fallback.")
     else:
         nse_live_refresh = False
         global_live_refresh = False
@@ -983,7 +983,7 @@ with tab6:
     
     data_sources = {
         "Data Type": ["MCX Commodities", "MCX History", "NSE/BSE Indices", "Global Futures", "Refresh", "Options Premiums"],
-        "Primary Source": ["Official MCX market watch", "Converted yfinance fallback", "Yahoo Finance", "Yahoo Finance", "1 second for MCX", "Estimated (Greeks)"],
+        "Primary Source": ["Official MCX market watch", "Converted yfinance fallback", "Yahoo Finance", "Investing.com commodities", "1 second for live sources", "Estimated (Greeks)"],
         "Fallback": ["Converted global futures", "Yahoo Finance", "Yahoo Finance", "Yahoo Finance", "Manual page refresh", "Estimated (Greeks)"]
     }
     
