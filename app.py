@@ -22,6 +22,8 @@ try:
     from analytics.candlestick_patterns import detect_candlestick_patterns, calculate_support_resistance
     from analytics.intraday_options import recommend_intraday_options, get_intraday_price_targets
     from analytics.mcx_live import get_live_mcx_quote
+    from analytics.live_nse import get_live_nse_quote
+    from analytics.live_global import get_live_global_quote
 except ImportError as e:
     st.error(f"Analytics module error: {e}. Please ensure all files in analytics/ directory are created.")
     st.stop()
@@ -108,10 +110,22 @@ with st.sidebar:
         )
         st.info("📌 **MCX DATA**: Using official MCX market-watch prices first; yfinance conversion is fallback/history.")
     elif asset_name in ["NIFTY", "SENSEX", "BANKNIFTY"]:
-        mcx_live_refresh = False
-        st.info("📌 **NSE DATA**: Using yfinance data. Real-time options data requires NSE API integration.")
+        nse_live_refresh = st.toggle(
+            "🔄 Refresh NSE live data every 1s",
+            value=True,
+            help="Polls NSE live data every second for real-time Indian index prices."
+        )
+        st.info("📌 **NSE DATA**: Using NSE live API with yfinance fallback for real-time index data.")
+    elif asset_name in ["GC=F", "CL=F", "SI=F", "NG=F", "HG=F", "ZW=F", "ZS=F"]:
+        global_live_refresh = st.toggle(
+            "🔄 Refresh Global live data every 1s",
+            value=True,
+            help="Polls global futures data every second for real-time international prices."
+        )
+        st.info("📌 **GLOBAL DATA**: Using enhanced yfinance for real-time futures data.")
     else:
-        mcx_live_refresh = False
+        nse_live_refresh = False
+        global_live_refresh = False
     
     # Option pricing parameters
     st.markdown("---")
@@ -295,6 +309,70 @@ def apply_live_mcx_quote(data: pd.DataFrame, quote: dict) -> pd.DataFrame:
     return updated
 
 
+@st.cache_data(ttl=1, show_spinner=False)
+def fetch_live_nse_quote(asset_name: str):
+    """Fetch a fresh NSE index quote."""
+    try:
+        return get_live_nse_quote(asset_name)
+    except Exception as e:
+        return {"error": str(e), "source": "NSE API"}
+
+@st.cache_data(ttl=1, show_spinner=False)
+def fetch_live_global_quote(asset_name: str):
+    """Fetch a fresh global futures quote."""
+    try:
+        return get_live_global_quote(asset_name)
+    except Exception as e:
+        return {"error": str(e), "source": "Global API"}
+
+
+def apply_live_nse_quote(data: pd.DataFrame, quote: dict) -> pd.DataFrame:
+    """Patch the latest candle with the latest NSE live quote."""
+    if not quote or quote.get("price") is None:
+        return data
+
+    updated = data.copy()
+    last_idx = updated.index[-1]
+    price = float(quote["price"])
+
+    updated.at[last_idx, "Close"] = price
+    if "Open" in updated.columns and quote.get("open") is not None:
+        updated.at[last_idx, "Open"] = float(quote["open"])
+    if "High" in updated.columns:
+        quote_high = float(quote["high"]) if quote.get("high") is not None else price
+        updated.at[last_idx, "High"] = max(quote_high, price)
+    if "Low" in updated.columns:
+        quote_low = float(quote["low"]) if quote.get("low") is not None else price
+        updated.at[last_idx, "Low"] = min(quote_low, price)
+    if "Volume" in updated.columns and quote.get("volume") is not None:
+        updated.at[last_idx, "Volume"] = float(quote["volume"])
+
+    return updated
+
+def apply_live_global_quote(data: pd.DataFrame, quote: dict) -> pd.DataFrame:
+    """Patch the latest candle with the latest global futures quote."""
+    if not quote or quote.get("price") is None:
+        return data
+
+    updated = data.copy()
+    last_idx = updated.index[-1]
+    price = float(quote["price"])
+
+    updated.at[last_idx, "Close"] = price
+    if "Open" in updated.columns and quote.get("open") is not None:
+        updated.at[last_idx, "Open"] = float(quote["open"])
+    if "High" in updated.columns:
+        quote_high = float(quote["high"]) if quote.get("high") is not None else price
+        updated.at[last_idx, "High"] = max(quote_high, price)
+    if "Low" in updated.columns:
+        quote_low = float(quote["low"]) if quote.get("low") is not None else price
+        updated.at[last_idx, "Low"] = min(quote_low, price)
+    if "Volume" in updated.columns and quote.get("volume") is not None:
+        updated.at[last_idx, "Volume"] = float(quote["volume"])
+
+    return updated
+
+
 # Fetch data
 data = fetch_data(yf_ticker, period)
 
@@ -311,10 +389,19 @@ if volume_col and volume_col in data.columns:
     data = data.dropna(subset=[volume_col])
 
 mcx_quote = {}
+nse_quote = {}
+global_quote = {}
+
 if asset_name.startswith("MCX"):
     data = convert_mcx_history_to_inr(data, asset_name)
     mcx_quote = fetch_live_mcx_quote(asset_name) or {}
     data = apply_live_mcx_quote(data, mcx_quote)
+elif asset_name in ["NIFTY", "SENSEX", "BANKNIFTY"]:
+    nse_quote = fetch_live_nse_quote(asset_name) or {}
+    data = apply_live_nse_quote(data, nse_quote)
+elif asset_name in ["GC=F", "CL=F", "SI=F", "NG=F", "HG=F", "ZW=F", "ZS=F"]:
+    global_quote = fetch_live_global_quote(asset_name) or {}
+    data = apply_live_global_quote(data, global_quote)
 
 # ============ TECHNICAL INDICATORS ============
 
@@ -373,6 +460,30 @@ if asset_name.startswith("MCX"):
         st.warning(f"📡 MCX market-watch unavailable: {mcx_quote['error']}. Showing converted yfinance fallback.")
     else:
         st.warning("📡 MCX market-watch did not return a quote. Showing converted yfinance fallback.")
+elif asset_name in ["NIFTY", "SENSEX", "BANKNIFTY"]:
+    if nse_quote.get("price") is not None:
+        quote_time = nse_quote.get("timestamp") or datetime.now()
+        change_text = f" | Change: {nse_quote['change']:.2f} ({nse_quote['change_percent']:.2f}%)"
+        st.success(
+            f"📡 NSE Live quote: {display_currency}{nse_quote['price']:.2f}{change_text}"
+            f" | refreshed {quote_time.strftime('%H:%M:%S')} | Source: {nse_quote.get('source', 'NSE')}"
+        )
+    elif nse_quote.get("error"):
+        st.warning(f"📡 NSE live data unavailable: {nse_quote['error']}. Showing yfinance fallback.")
+    else:
+        st.warning("📡 NSE live data not available. Showing yfinance fallback.")
+elif asset_name in ["GC=F", "CL=F", "SI=F", "NG=F", "HG=F", "ZW=F", "ZS=F"]:
+    if global_quote.get("price") is not None:
+        quote_time = global_quote.get("timestamp") or datetime.now()
+        change_text = f" | Change: {global_quote['change']:.2f} ({global_quote['change_percent']:.2f}%)"
+        st.success(
+            f"📡 Global Live quote: {display_currency}{global_quote['price']:.2f}{change_text}"
+            f" | refreshed {quote_time.strftime('%H:%M:%S')} | Source: {global_quote.get('source', 'Global')}"
+        )
+    elif global_quote.get("error"):
+        st.warning(f"📡 Global live data unavailable: {global_quote['error']}. Showing yfinance fallback.")
+    else:
+        st.warning("📡 Global live data not available. Showing yfinance fallback.")
 col1, col2, col3, col4, col5, col6 = st.columns(6)
 col1.metric("Price Change", f"{last_change:.2f}%", delta=last_change)
 col2.metric("RSI (14)", f"{rsi:.1f}", "Overbought ↑" if rsi > 70 else "Oversold ↓" if rsi < 30 else "Neutral →")
@@ -806,6 +917,8 @@ with tab6:
 st.markdown("---")
 st.markdown("*⚠️ **DISCLAIMER**: This is an educational tool for analysis. Not financial advice. Always consult a professional advisor before trading. Past performance doesn't guarantee future results.*")
 
-if asset_name.startswith("MCX") and mcx_live_refresh:
+if (asset_name.startswith("MCX") and mcx_live_refresh) or \
+   (asset_name in ["NIFTY", "SENSEX", "BANKNIFTY"] and nse_live_refresh) or \
+   (asset_name in ["GC=F", "CL=F", "SI=F", "NG=F", "HG=F", "ZW=F", "ZS=F"] and global_live_refresh):
     time.sleep(1)
     st.rerun()
