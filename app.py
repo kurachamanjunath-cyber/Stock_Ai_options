@@ -21,7 +21,7 @@ try:
     from analytics.candlestick_patterns import detect_candlestick_patterns, calculate_support_resistance
     from analytics.intraday_options import recommend_intraday_options, get_intraday_price_targets
     from analytics.mcx_live import get_live_mcx_quote
-    from analytics.live_nse import get_live_nse_quote
+    from analytics.live_nse import get_live_nse_quote, get_nse_index_history
     from analytics.live_global import get_live_global_quote
     from analytics.target_price_forecast import FORECAST_INTERVALS, build_target_price_forecast
 except ImportError as e:
@@ -271,6 +271,11 @@ def fetch_forecast_history(yf_ticker: str, asset_key: str) -> pd.DataFrame:
     try:
         if yf_ticker == "LD=F":
             return pd.DataFrame()
+
+        if asset_key in ["NIFTY", "BANKNIFTY"]:
+            nse_history = get_nse_index_history(asset_key)
+            if nse_history is not None and not nse_history.empty:
+                return nse_history.tail(240)
 
         history = yf.download(yf_ticker, period="5d", interval="5m", progress=False)
         if history.empty:
