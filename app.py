@@ -34,6 +34,23 @@ st.set_page_config(page_title="Advanced Intraday Options Predictor", layout="wid
 
 st.title("📊 Advanced INTRADAY Options Predictor")
 st.markdown("**INTRADAY CALL/PUT Signals → Today's Entry & Target Prices for MCX Commodities, NSE Indices & Global Futures**")
+st.markdown(
+    """
+    <style>
+    /* Keep live forecast values visible while Streamlit refreshes fragments. */
+    [data-testid="stApp"][data-test-script-state="running"] [data-testid="stElementContainer"],
+    [data-testid="stApp"][data-test-script-state="running"] [data-testid="stVerticalBlock"],
+    [data-testid="stApp"][data-test-script-state="running"] [data-testid="stDataFrame"],
+    [data-testid="stApp"] [class*="stale"],
+    [data-testid="stApp"] [class*="Stale"],
+    .stale-element {
+        opacity: 1 !important;
+        filter: none !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 ASSETS = {
     "🇮🇳 MCX Commodities": {
@@ -241,16 +258,20 @@ def apply_live_global_quote(data: pd.DataFrame, quote: dict) -> pd.DataFrame:
     return updated
 
 
-COMMODITY_FORECAST_ASSETS = {
+TARGET_FORECAST_ASSETS = {
     **ASSETS["🇮🇳 MCX Commodities"],
+    **ASSETS["📊 NSE Index Options"],
     **ASSETS["🌍 Global Futures"],
 }
 
 
-@st.cache_data(ttl=1, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_forecast_history(yf_ticker: str, asset_key: str) -> pd.DataFrame:
     """Fetch short intraday candles for the fixed target-price forecast tab."""
     try:
+        if yf_ticker == "LD=F":
+            return pd.DataFrame()
+
         history = yf.download(yf_ticker, period="5d", interval="5m", progress=False)
         if history.empty:
             history = yf.download(yf_ticker, period="1mo", progress=False)
@@ -293,6 +314,34 @@ def add_forecast_indicators(history: pd.DataFrame, close_col_name: str = "Close"
     return enriched
 
 
+def rebase_history_to_live_price(
+    history: pd.DataFrame,
+    live_price: float,
+    close_col_name: str = "Close"
+) -> pd.DataFrame:
+    """
+    Rebase a related futures history to the selected live instrument price.
+
+    MCX forecast rows use global futures candles for direction, but the displayed
+    target must stay on the live MCX price scale. This keeps paired MCX/global
+    forecasts directionally aligned without using USD/INR conversion logic.
+    """
+    if history.empty or close_col_name not in history.columns:
+        return history
+
+    latest_close = history[close_col_name].dropna().iloc[-1]
+    if latest_close <= 0 or live_price <= 0:
+        return history
+
+    rebased = history.copy()
+    factor = live_price / float(latest_close)
+    for col in ["Open", "High", "Low", "Close", "Adj Close"]:
+        if col in rebased.columns:
+            rebased[col] = rebased[col] * factor
+
+    return rebased
+
+
 @st.cache_data(ttl=1, show_spinner=False)
 def get_forecast_sentiment(asset_label: str) -> dict:
     """Refresh commodity-news sentiment with the same 1-second cadence as quotes."""
@@ -306,9 +355,11 @@ def get_forecast_sentiment(asset_label: str) -> dict:
 
 
 def get_forecast_live_quote(asset_key: str, yf_ticker: str) -> dict:
-    """Fetch the live quote source appropriate for the commodity forecast table."""
+    """Fetch the live quote source appropriate for the target forecast table."""
     if asset_key.startswith("MCX"):
         return fetch_live_mcx_quote(asset_key) or {}
+    if asset_key in ["NIFTY", "SENSEX", "BANKNIFTY"]:
+        return fetch_live_nse_quote(asset_key) or {}
     return fetch_live_global_quote(yf_ticker) or {}
 
 
@@ -861,22 +912,16 @@ with tab6:
 
 # ============ TAB 7: TARGET PRICE FORECAST ============
 
-with tab7:
-    st.markdown("## 🎯 Fixed-Interval Target Price Forecast")
-    st.caption(
-        "Live commodity price beside expected target prices for 15, 30, 45 minutes, "
-        "1 hour, and 2-5 hours. Forecasts refresh every second when the sidebar toggle is enabled."
-    )
-
+def render_target_price_forecast():
+    """Render target-price forecasts inside a Streamlit fragment."""
     forecast_rows = []
-    detail_rows = []
     status_rows = []
 
-    for commodity_key, (commodity_label, commodity_currency, commodity_yf_ticker) in COMMODITY_FORECAST_ASSETS.items():
-        forecast_history = fetch_forecast_history(commodity_yf_ticker, commodity_key)
+    for asset_key, (asset_label, asset_currency, asset_yf_ticker) in TARGET_FORECAST_ASSETS.items():
+        forecast_history = fetch_forecast_history(asset_yf_ticker, asset_key)
         if forecast_history.empty:
             status_rows.append({
-                "Commodity": commodity_label,
+                "Instrument": asset_label,
                 "Status": "No candle history available",
             })
             continue
@@ -884,21 +929,30 @@ with tab7:
         forecast_close_col = "Close" if "Close" in forecast_history.columns else "Adj Close"
         forecast_volume_col = "Volume" if "Volume" in forecast_history.columns else None
 
-        live_quote = get_forecast_live_quote(commodity_key, commodity_yf_ticker)
-        if commodity_key.startswith("MCX"):
-            forecast_history = apply_live_mcx_quote(forecast_history, live_quote)
-            forecast_currency = "₹"
-        else:
-            forecast_history = apply_live_global_quote(forecast_history, live_quote)
-            forecast_currency = commodity_currency
-
-        forecast_history = add_forecast_indicators(forecast_history, forecast_close_col)
+        live_quote = get_forecast_live_quote(asset_key, asset_yf_ticker)
         live_price = (
             float(live_quote["price"])
             if live_quote and live_quote.get("price") is not None
             else float(forecast_history[forecast_close_col].iloc[-1])
         )
-        sentiment_for_forecast = get_forecast_sentiment(commodity_label)
+
+        if asset_key.startswith("MCX"):
+            forecast_history = rebase_history_to_live_price(
+                forecast_history,
+                live_price,
+                forecast_close_col,
+            )
+            forecast_history = apply_live_mcx_quote(forecast_history, live_quote)
+            forecast_currency = "₹"
+        elif asset_key in ["NIFTY", "SENSEX", "BANKNIFTY"]:
+            forecast_history = apply_live_nse_quote(forecast_history, live_quote)
+            forecast_currency = "₹"
+        else:
+            forecast_history = apply_live_global_quote(forecast_history, live_quote)
+            forecast_currency = asset_currency
+
+        forecast_history = add_forecast_indicators(forecast_history, forecast_close_col)
+        sentiment_for_forecast = get_forecast_sentiment(asset_label)
 
         forecast_result = build_target_price_forecast(
             forecast_history,
@@ -911,13 +965,13 @@ with tab7:
 
         if not forecast_result.get("rows"):
             status_rows.append({
-                "Commodity": commodity_label,
+                "Instrument": asset_label,
                 "Status": forecast_result.get("message", "Forecast unavailable"),
             })
             continue
 
         summary_row = {
-            "Commodity": commodity_label,
+            "Instrument": asset_label,
             "Live Price": format_forecast_price(live_price, forecast_currency),
             "Bias": forecast_result.get("signal", "NEUTRAL"),
             "Confidence": f"{forecast_result.get('confidence', 0):.0f}%",
@@ -934,23 +988,14 @@ with tab7:
                 row["Forecast Expected Price"],
                 forecast_currency,
             )
-            detail_rows.append({
-                "Commodity": commodity_label,
-                "Interval": interval_label,
-                "Live Price": format_forecast_price(row["Current Price"], forecast_currency),
-                "Forecast Expected Price": format_forecast_price(row["Forecast Expected Price"], forecast_currency),
-                "Expected Change %": f"{row['Expected Change %']:+.2f}%",
-                "Direction": row["Direction"],
-                "Confidence": f"{row['Confidence %']:.0f}%",
-            })
 
         forecast_rows.append(summary_row)
 
     if forecast_rows:
-        st.subheader("All Commodities Forecast Grid")
+        st.subheader("All Instruments Forecast Grid")
         interval_columns = [f"{label} Forecast" for label, _ in FORECAST_INTERVALS]
         base_columns = [
-            "Commodity",
+            "Instrument",
             "Live Price",
             *interval_columns,
             "Bias",
@@ -963,27 +1008,44 @@ with tab7:
         ]
         forecast_df = pd.DataFrame(forecast_rows)
         display_columns = [col for col in base_columns if col in forecast_df.columns]
-        st.dataframe(forecast_df[display_columns], use_container_width=True, hide_index=True)
-
-        st.subheader("Current vs Forecast by Interval")
-        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+        st.dataframe(forecast_df[display_columns], width="stretch", hide_index=True)
 
     if status_rows:
-        st.warning("Some commodity forecasts could not be generated from the current data source.")
-        st.dataframe(pd.DataFrame(status_rows), use_container_width=True, hide_index=True)
+        st.warning("Some instrument forecasts could not be generated from the current data source.")
+        st.dataframe(pd.DataFrame(status_rows), width="stretch", hide_index=True)
 
     st.info(
         "The model checks candle-pattern direction, support/resistance, recent momentum, "
-        "volume spikes, available open interest fields, and commodity news sentiment. "
-        "Open interest is marked unavailable when the upstream commodity feed does not provide it."
+        "volume spikes, available open interest fields, and instrument news sentiment. "
+        "Open interest is marked unavailable when the upstream feed does not provide it."
     )
+
+
+@st.fragment(run_every="1s")
+def render_live_target_price_forecast():
+    """Refresh only the target forecast section in the background."""
+    render_target_price_forecast()
+
+
+with tab7:
+    st.markdown("## 🎯 Fixed-Interval Target Price Forecast")
+    st.caption(
+        "Live instrument price beside expected target prices for 15, 30, 45 minutes, "
+        "1 hour, and 2-5 hours. Forecasts refresh in the background when the sidebar toggle is enabled."
+    )
+
+    if target_forecast_refresh:
+        render_live_target_price_forecast()
+    else:
+        render_target_price_forecast()
 
 st.markdown("---")
 st.markdown("*⚠️ **DISCLAIMER**: This is an educational tool for analysis. Not financial advice. Always consult a professional advisor before trading. Past performance doesn't guarantee future results.*")
 
-if (asset_name.startswith("MCX") and mcx_live_refresh) or \
-   (asset_name in ["NIFTY", "SENSEX", "BANKNIFTY"] and nse_live_refresh) or \
-   (asset_name in ["GC=F", "CL=F", "SI=F", "NG=F", "HG=F", "ZW=F", "ZS=F"] and global_live_refresh) or \
-   target_forecast_refresh:
+if not target_forecast_refresh and (
+    (asset_name.startswith("MCX") and mcx_live_refresh) or
+    (asset_name in ["NIFTY", "SENSEX", "BANKNIFTY"] and nse_live_refresh) or
+    (asset_name in ["GC=F", "CL=F", "SI=F", "NG=F", "HG=F", "ZW=F", "ZS=F"] and global_live_refresh)
+):
     time.sleep(1)
     st.rerun()
