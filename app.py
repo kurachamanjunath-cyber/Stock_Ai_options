@@ -8,7 +8,6 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from typing import Tuple
 import time
 import warnings
 warnings.filterwarnings('ignore')
@@ -36,25 +35,6 @@ st.set_page_config(page_title="Advanced Intraday Options Predictor", layout="wid
 st.title("📊 Advanced INTRADAY Options Predictor")
 st.markdown("**INTRADAY CALL/PUT Signals → Today's Entry & Target Prices for MCX Commodities, NSE Indices & Global Futures**")
 
-# Fetch live USD to INR conversion rate
-@st.cache_data(ttl=3600)  # Cache for 1 hour
-def get_usd_to_inr():
-    """Fetch live USD to INR exchange rate from yfinance"""
-    try:
-        inr_data = yf.download("INR=X", period="1d", progress=False)
-        if not inr_data.empty:
-            rate = inr_data['Close'].iloc[-1]
-            st.sidebar.success(f"💱 Live USD/INR: ₹{rate:.2f}")
-            return rate
-    except Exception as e:
-        pass
-    
-    # Fallback to default value
-    st.sidebar.warning("⚠️ Using default USD/INR = ₹83.50")
-    return 83.50
-
-USD_TO_INR = get_usd_to_inr()
-
 ASSETS = {
     "🇮🇳 MCX Commodities": {
         "MCXGOLD": ("Gold (MCX India)", "₹", "GC=F"),
@@ -77,9 +57,6 @@ ASSETS = {
         "NG=F": ("Natural Gas Futures (Global)", "$", "NG=F"),
     }
 }
-
-# USD to INR conversion rate (approximate, should be updated daily)
-USD_TO_INR = 83.5
 
 # Sidebar configuration
 with st.sidebar:
@@ -115,7 +92,7 @@ with st.sidebar:
             value=True,
             help="Polls the official MCX market-watch source every second while an MCX commodity is selected."
         )
-        st.info("📌 **MCX DATA**: Using official MCX market-watch prices first; yfinance conversion is fallback/history.")
+        st.info("📌 **MCX DATA**: Using official MCX market-watch prices first; yfinance is fallback/history.")
     elif asset_name in ["NIFTY", "SENSEX", "BANKNIFTY"]:
         nse_live_refresh = st.toggle(
             "🔄 Refresh NSE live data every 1s",
@@ -144,106 +121,6 @@ with st.sidebar:
 
 # ============ DATA FETCHING & PROCESSING ============
 
-@st.cache_data(ttl=3600)
-def get_mcx_conversion_factors():
-    """
-    Fetch live MCX reference prices and calculate conversion factors dynamically.
-    Conversion factor = MCX price / Global futures price (converted to INR)
-    
-    Returns:
-        Dict with conversion factors for each MCX commodity
-    """
-    try:
-        # MCX reference prices (in ₹) - fetched from MCX website
-        # These are typical/baseline prices used to calibrate conversion
-        mcx_reference = {
-            "MCXNATURALGAS": 260.50,  # Natural Gas (26 May contract)
-            "MCXGOLD": 152589.00,      # Gold (05 Jun contract)
-            "MCXSILVER": 261999.00,    # Silver (03 Jul contract)
-            "MCXCRUDE": 9022.00,       # Crude Oil (18 May contract)
-            "MCXCOPPER": 1325.40,      # Copper (29 May contract)
-            "MCXZINC": 348.40,         # Zinc (29 May contract)
-            "MCXLEAD": 200.30,         # Lead (29 May contract)
-        }
-        
-        # Fetch global futures reference prices
-        global_futures = {
-            "MCXNATURALGAS": "NG=F",
-            "MCXGOLD": "GC=F",
-            "MCXSILVER": "SI=F",
-            "MCXCRUDE": "CL=F",
-            "MCXCOPPER": "HG=F",
-        }
-        
-        conversion_factors = {}
-        
-        for mcx_ticker, futures_ticker in global_futures.items():
-            try:
-                # Fetch global futures price
-                data = yf.download(futures_ticker, period="1d", progress=False)
-                if not data.empty:
-                    global_price_usd = data['Close'].iloc[-1]
-                    global_price_inr = global_price_usd * USD_TO_INR
-                    
-                    mcx_ref = mcx_reference.get(mcx_ticker, 1)
-                    
-                    # Calculate conversion factor
-                    if global_price_inr > 0:
-                        factor = mcx_ref / global_price_inr
-                        conversion_factors[mcx_ticker] = factor
-                    else:
-                        conversion_factors[mcx_ticker] = 1.0
-            except Exception as e:
-                st.warning(f"Could not fetch conversion factor for {mcx_ticker}: {e}")
-                conversion_factors[mcx_ticker] = 1.0
-        
-        # For commodities without direct futures mapping
-        conversion_factors["MCXZINC"] = 1.0
-        conversion_factors["MCXLEAD"] = 1.0
-        
-        return conversion_factors
-        
-    except Exception as e:
-        st.warning(f"Error calculating MCX conversion factors: {e}")
-        # Return default factors if calculation fails
-        return {
-            "MCXNATURALGAS": 1.13,
-            "MCXGOLD": 31.1035,
-            "MCXSILVER": 31.1035,
-            "MCXCRUDE": 1.0,
-            "MCXCOPPER": 1.0,
-            "MCXZINC": 1.0,
-            "MCXLEAD": 1.0,
-        }
-
-# Get conversion factors at app start
-MCX_FACTORS = get_mcx_conversion_factors()
-
-def convert_price_for_display(price: float, asset_name: str, raw_currency: str) -> Tuple[float, str]:
-    """
-    Convert price to appropriate display currency for MCX commodities using live conversion factors.
-    
-    Args:
-        price: Raw price from yfinance (global futures in USD)
-        asset_name: Asset identifier
-        raw_currency: Original currency ($)
-    
-    Returns:
-        Tuple of (converted_price, display_currency)
-    """
-    if asset_name.startswith("MCX"):
-        # Convert USD to INR
-        converted = price * USD_TO_INR
-        
-        # Apply dynamic MCX conversion factor based on live prices
-        factor = MCX_FACTORS.get(asset_name, 1.0)
-        converted = converted * factor
-        
-        return converted, "₹"
-    else:
-        return price, raw_currency
-
-
 @st.cache_data(ttl=300)
 def fetch_data(ticker, period):
     """
@@ -265,22 +142,6 @@ def fetch_data(ticker, period):
     except Exception as e:
         st.error(f"Error fetching data: {e}")
         return None
-
-
-def convert_mcx_history_to_inr(data: pd.DataFrame, asset_name: str) -> pd.DataFrame:
-    """Convert yfinance global futures history into the app's MCX INR display scale."""
-    if not asset_name.startswith("MCX"):
-        return data
-
-    converted = data.copy()
-    factor = MCX_FACTORS.get(asset_name, 1.0)
-    multiplier = USD_TO_INR * factor
-
-    for col in ["Open", "High", "Low", "Close", "Adj Close"]:
-        if col in converted.columns:
-            converted[col] = converted[col] * multiplier
-
-    return converted
 
 
 @st.cache_data(ttl=1, show_spinner=False)
@@ -398,9 +259,6 @@ def fetch_forecast_history(yf_ticker: str, asset_key: str) -> pd.DataFrame:
             history.columns = history.columns.get_level_values(0)
         history.columns = history.columns.str.strip().str.title()
 
-        if asset_key.startswith("MCX"):
-            history = convert_mcx_history_to_inr(history, asset_key)
-
         return history.tail(240)
     except Exception:
         return pd.DataFrame()
@@ -482,7 +340,6 @@ nse_quote = {}
 global_quote = {}
 
 if asset_name.startswith("MCX"):
-    data = convert_mcx_history_to_inr(data, asset_name)
     mcx_quote = fetch_live_mcx_quote(asset_name) or {}
     data = apply_live_mcx_quote(data, mcx_quote)
 elif asset_name in ["NIFTY", "SENSEX", "BANKNIFTY"]:
@@ -520,10 +377,8 @@ data["Daily Change"] = data[close_col].pct_change() * 100
 
 # Current metrics
 current_price_raw = data[close_col].iloc[-1]
-if asset_name.startswith("MCX"):
-    current_price, display_currency = float(current_price_raw), "₹"
-else:
-    current_price, display_currency = convert_price_for_display(current_price_raw, asset_name, currency)
+current_price = float(current_price_raw)
+display_currency = currency
 
 last_change = data["Daily Change"].iloc[-1]
 sma_10 = data["SMA_10"].iloc[-1]
@@ -546,9 +401,9 @@ if asset_name.startswith("MCX"):
             f" | refreshed {quote_time.strftime('%H:%M:%S')}{expiry_text}"
         )
     elif mcx_quote.get("error"):
-        st.warning(f"📡 MCX market-watch unavailable: {mcx_quote['error']}. Showing converted yfinance fallback.")
+        st.warning(f"📡 MCX market-watch unavailable: {mcx_quote['error']}. Showing yfinance fallback/history.")
     else:
-        st.warning("📡 MCX market-watch did not return a quote. Showing converted yfinance fallback.")
+        st.warning("📡 MCX market-watch did not return a quote. Showing yfinance fallback/history.")
 elif asset_name in ["NIFTY", "SENSEX", "BANKNIFTY"]:
     if nse_quote.get("price") is not None:
         quote_time = nse_quote.get("timestamp") or datetime.now()
@@ -976,15 +831,15 @@ with tab6:
 
     MCX commodities now use the official MCX market-watch data source first.
     The latest quote patches the current candle, while historical candles still use
-    yfinance converted to the MCX INR scale as a fallback/history source.
+    yfinance as a fallback/history source.
 
     ### 📊 Data Sources Comparison:
     """)
     
     data_sources = {
         "Data Type": ["MCX Commodities", "MCX History", "NSE/BSE Indices", "Global Futures", "Refresh", "Options Premiums"],
-        "Primary Source": ["Official MCX market watch", "Converted yfinance fallback", "Yahoo Finance", "Investing.com commodities", "1 second for live sources", "Estimated (Greeks)"],
-        "Fallback": ["Converted global futures", "Yahoo Finance", "Yahoo Finance", "Yahoo Finance", "Manual page refresh", "Estimated (Greeks)"]
+        "Primary Source": ["Official MCX market watch", "yfinance fallback", "Yahoo Finance", "Investing.com commodities", "1 second for live sources", "Estimated (Greeks)"],
+        "Fallback": ["Global futures history", "Yahoo Finance", "Yahoo Finance", "Yahoo Finance", "Manual page refresh", "Estimated (Greeks)"]
     }
     
     st.dataframe(pd.DataFrame(data_sources), use_container_width=True)
@@ -994,7 +849,7 @@ with tab6:
     - **📊 Official MCX commodity quotes** - Directly from MCX market watch
     - **🔐 No broker token required** - No Dhan client id or access token
     - **🔄 1-second polling** - Dashboard reruns while MCX refresh is enabled
-    - **🛟 Fallback retained** - Converted global futures are still available if MCX blocks the request
+    - **🛟 Fallback retained** - Global futures history is still available if MCX blocks the request
     """)
     
     st.warning("""
