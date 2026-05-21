@@ -14,10 +14,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 try:
-    import cloudscraper
-    HAS_CLOUDSCRAPER = True
+    from playwright.sync_api import sync_playwright
+    HAS_PLAYWRIGHT = True
 except ImportError:
-    HAS_CLOUDSCRAPER = False
+    HAS_PLAYWRIGHT = False
 
 class GlobalLiveData:
     """Fetch live global futures data."""
@@ -55,33 +55,61 @@ class GlobalLiveData:
             return None
 
     def _get_investing_html(self) -> Optional[str]:
-        """Fetch and briefly cache the Investing.com commodities page."""
+        """Fetch and briefly cache the Investing.com commodities page using Playwright."""
         now = time.time()
         if self.page_cache and (now - self.page_last_fetch) < self.cache_timeout:
             return self.page_cache
 
-        # Try cloudscraper first (handles Cloudflare protection)
-        if HAS_CLOUDSCRAPER:
-            try:
-                scraper = cloudscraper.create_scraper()
-                response = scraper.get(
-                    self.INVESTING_COMMODITIES_URL,
-                    timeout=10,
-                    allow_redirects=True
-                )
-                response.raise_for_status()
-                self.page_cache = response.text
-                self.page_last_fetch = now
-                print("✓ Fetched from Investing.com using cloudscraper")
-                return self.page_cache
-            except Exception as e:
-                print(f"[Investing.com] Cloudscraper blocked: {str(e)[:100]}")
-        
+        # Try Playwright first (real browser, best for Cloudflare)
+        if HAS_PLAYWRIGHT:
+            # Try Firefox first (better anti-bot evasion), then Chromium
+            browsers_to_try = [
+                ('firefox', lambda p: p.firefox),
+                ('chromium', lambda p: p.chromium),
+            ]
+            
+            for browser_name, browser_getter in browsers_to_try:
+                try:
+                    with sync_playwright() as p:
+                        browser_obj = browser_getter(p)
+                        browser = browser_obj.launch(headless=True)
+                        context = browser.new_context(
+                            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+                            viewport={"width": 1920, "height": 1080},
+                            locale="en-IN",
+                            timezone_id="Asia/Kolkata"
+                        )
+                        page = context.new_page()
+                        
+                        try:
+                            # Navigate with a 15 second timeout and domcontentloaded
+                            page.goto(self.INVESTING_COMMODITIES_URL, wait_until="domcontentloaded", timeout=15000)
+                            # Give JS time to render
+                            page.wait_for_timeout(2000)
+                            
+                            html_content = page.content()
+                            browser.close()
+                            
+                            if html_content and len(html_content) > 1000:
+                                self.page_cache = html_content
+                                self.page_last_fetch = now
+                                print(f"✓ Fetched from Investing.com using {browser_name.upper()}")
+                                return self.page_cache
+                        except Exception as page_error:
+                            browser.close()
+                            # Try next browser
+                            continue
+                            
+                except Exception as e:
+                    # Try next browser
+                    continue
+                    
         # Multiple user agents to rotate
         user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
         ]
         
         user_agent = random.choice(user_agents)
@@ -89,7 +117,7 @@ class GlobalLiveData:
         headers = {
             "User-Agent": user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Language": "en-IN,en;q=0.9",
+            "Accept-Language": "en-IN,en;q=0.9,en;q=0.8",
             "Accept-Encoding": "gzip, deflate, br",
             "DNT": "1",
             "Connection": "keep-alive",
@@ -97,15 +125,18 @@ class GlobalLiveData:
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "none",
+            "Sec-Ch-Ua": '"Not A(Brand";v="99", "Google Chrome";v="125"',
+            "Sec-Ch-Ua-Mobile": "?0",
             "Cache-Control": "max-age=0",
+            "Referer": "https://www.investing.com/",
         }
         
         try:
             session = requests.Session()
-            # Add retry strategy
+            # Increase retry attempts for 403 errors
             retry_strategy = Retry(
-                total=1,
-                backoff_factor=0.3,
+                total=3,
+                backoff_factor=1.0,  # Increase backoff delay
                 status_forcelist=[403, 429, 500, 502, 503, 504],
                 allowed_methods=["GET"]
             )
@@ -113,21 +144,32 @@ class GlobalLiveData:
             session.mount("http://", adapter)
             session.mount("https://", adapter)
             
+            # Add a small delay to avoid rate limiting
+            time.sleep(random.uniform(0.5, 1.5))
+            
             response = session.get(
                 self.INVESTING_COMMODITIES_URL,
                 headers=headers,
-                timeout=8,
-                allow_redirects=True
+                timeout=15,
+                allow_redirects=True,
+                verify=True
             )
             response.raise_for_status()
-            self.page_cache = response.text
-            self.page_last_fetch = now
-            print("✓ Fetched from Investing.com using requests")
-            return self.page_cache
+            if response.status_code == 200:
+                self.page_cache = response.text
+                self.page_last_fetch = now
+                print("✓ Fetched from Investing.com using requests")
+                return self.page_cache
             
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 403:
+                print(f"[Investing.com] 403 Forbidden - Site may have stricter Cloudflare protection")
+            else:
+                print(f"[Investing.com] HTTP Error {e.response.status_code}")
         except Exception as e:
-            print(f"[Investing.com] Blocked ({str(e)[:80]}). Using Yahoo Finance fallback.")
-            return None
+            print(f"[Investing.com] Connection failed: {str(e)[:80]}")
+        
+        return None
 
     def _parse_investing_tables(self, page_html: str, investing_name: str) -> Optional[Dict]:
         """Read Investing.com commodity rows with pandas when table parsers are available."""

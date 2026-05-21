@@ -13,8 +13,11 @@ scipy
 transformers
 torch
 kiteconnect
-cloudscraper
+playwright
 lxml
+fastapi
+uvicorn
+websocket-client
 
 # Optional: For live MCX/NSE options data via WebSocket
 # websocket-client>=1.0.0

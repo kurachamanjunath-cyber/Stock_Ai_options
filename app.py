@@ -10,6 +10,15 @@ import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import time
 import warnings
+import json
+import queue
+import threading
+
+try:
+    import websocket
+except ImportError:
+    websocket = None
+
 warnings.filterwarnings('ignore')
 
 # Import analytics modules
@@ -75,6 +84,72 @@ ASSETS = {
     }
 }
 
+
+def _initialize_ws_client(asset_name: str, yf_ticker: str):
+    if websocket is None:
+        return
+
+    if "wsq" not in st.session_state:
+        st.session_state.wsq = queue.Queue()
+        st.session_state.ws_live_data = {}
+
+    if "ws_thread" in st.session_state and st.session_state.ws_thread is not None:
+        if st.session_state.ws_thread.is_alive():
+            return
+
+    def on_message(ws, message):
+        try:
+            payload = json.loads(message)
+            st.session_state.wsq.put(payload)
+        except Exception:
+            st.session_state.wsq.put({"raw": message})
+
+    def on_open(ws):
+        # Subscribe to the selected instrument for live streaming
+        if asset_name.startswith("MCX"):
+            subscribe = [f"mcx:{asset_name}"]
+        elif asset_name in ["NIFTY", "SENSEX", "BANKNIFTY"]:
+            subscribe = [f"nse:{asset_name}"]
+        else:
+            subscribe = [f"global:{yf_ticker}"]
+
+        ws.send(json.dumps({"subscribe": subscribe, "interval": 1.0}))
+
+    def run_ws():
+        while True:
+            try:
+                ws = websocket.WebSocketApp(
+                    "ws://127.0.0.1:8000/ws",
+                    on_message=on_message,
+                    on_open=on_open,
+                )
+                ws.run_forever()
+            except Exception:
+                time.sleep(5)
+
+    st.session_state.ws_thread = threading.Thread(target=run_ws, daemon=True)
+    st.session_state.ws_thread.start()
+
+
+def _drain_ws_queue():
+    if "wsq" not in st.session_state:
+        return
+    while True:
+        try:
+            item = st.session_state.wsq.get_nowait()
+            if isinstance(item, dict) and item.get("type") == "update":
+                st.session_state.ws_live_data.update(item.get("data", {}))
+            elif isinstance(item, dict):
+                st.session_state.ws_live_data.update(item)
+        except queue.Empty:
+            break
+
+
+def _get_ws_quote(kind: str, symbol: str):
+    if "ws_live_data" not in st.session_state:
+        return None
+    return st.session_state.ws_live_data.get(f"{kind.upper()}:{symbol}")
+
 # Sidebar configuration
 with st.sidebar:
     st.header("⚙️ Configuration")
@@ -109,6 +184,8 @@ with st.sidebar:
             value=True,
             help="Polls the official MCX market-watch source every second while an MCX commodity is selected."
         )
+        nse_live_refresh = False
+        global_live_refresh = False
         st.info("📌 **MCX DATA**: Using official MCX market-watch prices first; yfinance is fallback/history.")
     elif asset_name in ["NIFTY", "SENSEX", "BANKNIFTY"]:
         nse_live_refresh = st.toggle(
@@ -116,6 +193,8 @@ with st.sidebar:
             value=True,
             help="Polls NSE live data every second for real-time Indian index prices."
         )
+        mcx_live_refresh = False
+        global_live_refresh = False
         st.info("📌 **NSE DATA**: Using NSE live API with yfinance fallback for real-time index data.")
     elif asset_name in ["GC=F", "CL=F", "SI=F", "NG=F", "HG=F", "ZW=F", "ZS=F"]:
         global_live_refresh = st.toggle(
@@ -123,8 +202,11 @@ with st.sidebar:
             value=True,
             help="Polls global futures data every second for real-time international prices."
         )
+        mcx_live_refresh = False
+        nse_live_refresh = False
         st.info("📌 **GLOBAL DATA**: Using Investing.com commodities first with yfinance fallback.")
     else:
+        mcx_live_refresh = False
         nse_live_refresh = False
         global_live_refresh = False
     
@@ -135,6 +217,15 @@ with st.sidebar:
     
     # Fixed for intraday trading
     days_to_expiry = 1  # Intraday expiry (same day)
+
+    # Start WebSocket live streaming for selected instrument
+    _initialize_ws_client(asset_name, yf_ticker)
+
+    if mcx_live_refresh or nse_live_refresh or global_live_refresh:
+        st.markdown(
+            '<script>setTimeout(() => { window.location.reload(); }, 1000);</script>',
+            unsafe_allow_html=True,
+        )
 
 # ============ DATA FETCHING & PROCESSING ============
 
@@ -161,9 +252,13 @@ def fetch_data(ticker, period):
         return None
 
 
-@st.cache_data(ttl=1, show_spinner=False)
 def fetch_live_mcx_quote(asset_name: str):
     """Fetch a fresh MCX quote from the official market-watch source."""
+    _drain_ws_queue()
+    ws_quote = _get_ws_quote("mcx", asset_name)
+    if ws_quote and ws_quote.get("price") is not None:
+        return ws_quote
+
     try:
         return get_live_mcx_quote(asset_name)
     except Exception as e:
@@ -194,17 +289,25 @@ def apply_live_mcx_quote(data: pd.DataFrame, quote: dict) -> pd.DataFrame:
     return updated
 
 
-@st.cache_data(ttl=1, show_spinner=False)
 def fetch_live_nse_quote(asset_name: str):
     """Fetch a fresh NSE index quote."""
+    _drain_ws_queue()
+    ws_quote = _get_ws_quote("nse", asset_name)
+    if ws_quote and ws_quote.get("price") is not None:
+        return ws_quote
+
     try:
         return get_live_nse_quote(asset_name)
     except Exception as e:
         return {"error": str(e), "source": "NSE API"}
 
-@st.cache_data(ttl=1, show_spinner=False)
 def fetch_live_global_quote(asset_name: str):
     """Fetch a fresh global futures quote."""
+    _drain_ws_queue()
+    ws_quote = _get_ws_quote("global", asset_name)
+    if ws_quote and ws_quote.get("price") is not None:
+        return ws_quote
+
     try:
         return get_live_global_quote(asset_name)
     except Exception as e:
@@ -376,6 +479,21 @@ def format_forecast_price(value: float, currency_symbol: str) -> str:
         return f"{currency_symbol}0.00"
 
 
+def format_price_dynamic(value: float, currency_symbol: str) -> str:
+    """Format prices with higher precision for small-dollar instruments.
+
+    - If price < 10, show 3 decimal places (e.g., 2.994)
+    - Otherwise show 2 decimal places
+    """
+    try:
+        v = float(value)
+        if abs(v) < 10:
+            return f"{currency_symbol}{v:,.3f}"
+        return f"{currency_symbol}{v:,.2f}"
+    except Exception:
+        return f"{currency_symbol}0.00"
+
+
 # Fetch data
 data = fetch_data(yf_ticker, period)
 
@@ -447,7 +565,7 @@ volume_trend = data["Volume_Trend"].iloc[-1] if "Volume_Trend" in data.columns e
 # ============ MAIN DISPLAY ============
 
 # Current metrics
-st.subheader(f"📊 {display_name} | Current Price: {display_currency}{current_price:.2f}")
+st.subheader(f"📊 {display_name} | Current Price: {format_price_dynamic(current_price, display_currency)}")
 if asset_name.startswith("MCX"):
     if mcx_quote.get("price") is not None:
         quote_time = mcx_quote.get("timestamp") or datetime.now()
@@ -465,7 +583,7 @@ elif asset_name in ["NIFTY", "SENSEX", "BANKNIFTY"]:
         quote_time = nse_quote.get("timestamp") or datetime.now()
         change_text = f" | Change: {nse_quote['change']:.2f} ({nse_quote['change_percent']:.2f}%)"
         st.success(
-            f"📡 NSE Live quote: {display_currency}{nse_quote['price']:.2f}{change_text}"
+            f"📡 NSE Live quote: {format_price_dynamic(nse_quote['price'], display_currency)}{change_text}"
             f" | refreshed {quote_time.strftime('%H:%M:%S')} | Source: {nse_quote.get('source', 'NSE')}"
         )
     elif nse_quote.get("error"):
@@ -477,7 +595,7 @@ elif asset_name in ["GC=F", "CL=F", "SI=F", "NG=F", "HG=F", "ZW=F", "ZS=F"]:
         quote_time = global_quote.get("timestamp") or datetime.now()
         change_text = f" | Change: {global_quote['change']:.2f} ({global_quote['change_percent']:.2f}%)"
         st.success(
-            f"📡 Global Live quote: {display_currency}{global_quote['price']:.2f}{change_text}"
+            f"📡 Global Live quote: {format_price_dynamic(global_quote['price'], display_currency)}{change_text}"
             f" | refreshed {quote_time.strftime('%H:%M:%S')} | Source: {global_quote.get('source', 'Global')}"
         )
     elif global_quote.get("error"):
@@ -555,7 +673,7 @@ with tab1:
         col_levels_l, col_levels_r = st.columns(2)
         
         with col_levels_l:
-            st.markdown(f"**Current Price**\n# {display_currency}{current_price:.2f}")
+            st.markdown(f"**Current Price**\n# {format_price_dynamic(current_price, display_currency)}")
             st.markdown(f"**Support Level**\n# {display_currency}{sr_levels['support']:.2f}")
         
         with col_levels_r:
@@ -627,7 +745,7 @@ with tab1:
         **🟢 BUY CALL OPTION - BULLISH SETUP**
         
         **Current Technical Setup:**
-        - Price is at **{display_currency}{current_price:.2f}**
+        - Price is at **{format_price_dynamic(current_price, display_currency)}**
         - Support: **{display_currency}{sr_levels['support']:.2f}** | Resistance: **{display_currency}{sr_levels['resistance']:.2f}**
         - Pattern: **{pattern_name}** ({pattern_conf:.0f}% confidence)
         
@@ -642,7 +760,7 @@ with tab1:
         **🔴 BUY PUT OPTION - BEARISH SETUP**
         
         **Current Technical Setup:**
-        - Price is at **{display_currency}{current_price:.2f}**
+        - Price is at **{format_price_dynamic(current_price, display_currency)}**
         - Support: **{display_currency}{sr_levels['support']:.2f}** | Resistance: **{display_currency}{sr_levels['resistance']:.2f}**
         - Pattern: **{pattern_name}** ({pattern_conf:.0f}% confidence)
         
