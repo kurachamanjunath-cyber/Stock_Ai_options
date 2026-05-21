@@ -84,6 +84,8 @@ ASSETS = {
     }
 }
 
+INDEX_OPTION_ASSETS = ["NIFTY", "SENSEX", "BANKNIFTY"]
+
 
 def _initialize_ws_client(asset_name: str, yf_ticker: str):
     if websocket is None:
@@ -462,6 +464,12 @@ def get_forecast_sentiment(asset_label: str) -> dict:
     return analyze_news_sentiment(query.upper(), num_articles=5)
 
 
+@st.cache_data(ttl=1, show_spinner=False)
+def get_live_news_sentiment(asset_key: str, num_articles: int = 8) -> dict:
+    """Fetch impact news for the sentiment tab on the same 1-second cadence."""
+    return analyze_news_sentiment(asset_key, num_articles=num_articles)
+
+
 def get_forecast_live_quote(asset_key: str, yf_ticker: str) -> dict:
     """Fetch the live quote source appropriate for the target forecast table."""
     if asset_key.startswith("MCX"):
@@ -830,35 +838,91 @@ with tab3:
 
 # ============ TAB 4: NEWS SENTIMENT ============
 
+def _sentiment_color(sentiment_scale: int) -> str:
+    return "green" if sentiment_scale > 60 else "orange" if sentiment_scale > 40 else "red"
+
+
+def _sentiment_icon(score: float) -> str:
+    if score > 0.2:
+        return "📈"
+    if score < -0.2:
+        return "📉"
+    return "➡️"
+
+
+def render_news_sentiment_panel():
+    symbols_to_render = INDEX_OPTION_ASSETS if asset_name in INDEX_OPTION_ASSETS else [asset_name.replace("MCX", "").upper()]
+    title = "All NSE Index Options" if symbols_to_render == INDEX_OPTION_ASSETS else asset_name
+    st.subheader(f"📰 Market Sentiment for {title}")
+    st.caption("Auto-refreshing every 1 second with index-specific news that can impact CALL/PUT bias.")
+
+    sentiment_by_symbol = {
+        symbol: get_live_news_sentiment(symbol, num_articles=8)
+        for symbol in symbols_to_render
+    }
+
+    summary_rows = []
+    for symbol, sentiment_data in sentiment_by_symbol.items():
+        article_count = sentiment_data.get("num_articles_analyzed", 0)
+        summary_rows.append({
+            "Index Option": symbol,
+            "Sentiment": sentiment_data.get("sentiment_label", "NEUTRAL"),
+            "Score": f"{sentiment_data.get('sentiment_scale_100', 50):.0f}/100",
+            "Confidence": f"{sentiment_data.get('confidence', 0):.0f}%",
+            "Articles": article_count,
+            "Latest Impact": (
+                sentiment_data.get("top_articles", [{}])[0].get("impact", "No live article impact")
+                if article_count
+                else "No live article impact"
+            ),
+            "Updated": datetime.now().strftime("%H:%M:%S"),
+        })
+
+    st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
+
+    for symbol, sentiment_data in sentiment_by_symbol.items():
+        sentiment_scale = sentiment_data.get("sentiment_scale_100", 50)
+        color = _sentiment_color(sentiment_scale)
+        articles = sentiment_data.get("top_articles", [])
+
+        with st.expander(f"{symbol} impact news", expanded=True):
+            metric_col, news_col = st.columns([1, 2])
+
+            with metric_col:
+                st.markdown(f"""
+                <div style='text-align: center; padding: 20px; border-radius: 8px; background-color: {color}20;'>
+                <h3>Overall Sentiment</h3>
+                <h1 style='color: {color};'>{sentiment_scale:.0f}/100</h1>
+                <h4>{sentiment_data.get('sentiment_label', 'NEUTRAL')}</h4>
+                <p>Confidence: {sentiment_data.get('confidence', 0):.0f}%</p>
+                </div>
+                """, unsafe_allow_html=True)
+                st.caption(f"Query: {sentiment_data.get('query', symbol)}")
+
+            with news_col:
+                st.markdown("### Top Impact News")
+                if articles:
+                    for article in articles[:5]:
+                        headline = article.get("headline", "Untitled news")
+                        link = article.get("url", "")
+                        headline_text = f"[{headline}]({link})" if link else headline
+                        st.markdown(f"{_sentiment_icon(article.get('sentiment', 0))} **{headline_text}**")
+                        st.caption(
+                            f"Source: {article.get('source', 'Unknown')} | "
+                            f"Sentiment: {article.get('sentiment', 0):.2f} | "
+                            f"{article.get('impact', 'Mixed/neutral impact')}"
+                        )
+                else:
+                    st.info("No live articles returned right now. Check internet/API access or try again after a moment.")
+
+
+@st.fragment(run_every="1s")
+def render_live_news_sentiment_panel():
+    render_news_sentiment_panel()
+
+
 with tab4:
-    st.subheader(f"📰 Market Sentiment for {asset_name}")
-    
-    sentiment_data = analyze_news_sentiment(asset_name.replace("MCX", "").upper())
-    
-    col1, col2 = st.columns([1, 2])
-    
-    with col1:
-        sentiment_scale = sentiment_data["sentiment_scale_100"]
-        color = "green" if sentiment_scale > 60 else "orange" if sentiment_scale > 40 else "red"
-        
-        st.markdown(f"""
-        <div style='text-align: center; padding: 20px; border-radius: 10px; background-color: {color}20;'>
-        <h3>Overall Sentiment</h3>
-        <h1 style='color: {color};'>{sentiment_scale:.0f}/100</h1>
-        <h4>{sentiment_data['sentiment_label']}</h4>
-        <p>Confidence: {sentiment_data['confidence']:.0f}%</p>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        st.markdown("### Top News Stories")
-        if sentiment_data.get("top_articles"):
-            for article in sentiment_data.get("top_articles", [])[:5]:
-                sentiment_emoji = "📈" if article["sentiment"] > 0.2 else "📉" if article["sentiment"] < -0.2 else "➡️"
-                st.markdown(f"{sentiment_emoji} **{article['headline'][:80]}...**")
-                st.caption(f"Source: {article['source']} | Sentiment: {article['sentiment']:.2f}")
-        else:
-            st.info("No articles available for sentiment analysis")
+    render_live_news_sentiment_panel()
 
 # ============ TAB 5: INTRADAY OPTIONS WITH CANDLESTICK PATTERNS ============
 
