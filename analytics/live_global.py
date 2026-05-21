@@ -1,6 +1,7 @@
 """Live global futures and options data fetching."""
 import html
 import re
+import random
 from io import StringIO
 
 import yfinance as yf
@@ -9,6 +10,14 @@ from datetime import datetime
 from typing import Dict, Optional
 import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+try:
+    import cloudscraper
+    HAS_CLOUDSCRAPER = True
+except ImportError:
+    HAS_CLOUDSCRAPER = False
 
 class GlobalLiveData:
     """Fetch live global futures data."""
@@ -51,20 +60,74 @@ class GlobalLiveData:
         if self.page_cache and (now - self.page_last_fetch) < self.cache_timeout:
             return self.page_cache
 
+        # Try cloudscraper first (handles Cloudflare protection)
+        if HAS_CLOUDSCRAPER:
+            try:
+                scraper = cloudscraper.create_scraper()
+                response = scraper.get(
+                    self.INVESTING_COMMODITIES_URL,
+                    timeout=10,
+                    allow_redirects=True
+                )
+                response.raise_for_status()
+                self.page_cache = response.text
+                self.page_last_fetch = now
+                print("✓ Fetched from Investing.com using cloudscraper")
+                return self.page_cache
+            except Exception as e:
+                print(f"[Investing.com] Cloudscraper blocked: {str(e)[:100]}")
+        
+        # Multiple user agents to rotate
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+        ]
+        
+        user_agent = random.choice(user_agents)
+        
         headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "User-Agent": user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "en-IN,en;q=0.9",
-            "Referer": "https://in.investing.com/",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Cache-Control": "max-age=0",
         }
-        response = requests.get(self.INVESTING_COMMODITIES_URL, headers=headers, timeout=8)
-        response.raise_for_status()
-        self.page_cache = response.text
-        self.page_last_fetch = now
-        return self.page_cache
+        
+        try:
+            session = requests.Session()
+            # Add retry strategy
+            retry_strategy = Retry(
+                total=1,
+                backoff_factor=0.3,
+                status_forcelist=[403, 429, 500, 502, 503, 504],
+                allowed_methods=["GET"]
+            )
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            
+            response = session.get(
+                self.INVESTING_COMMODITIES_URL,
+                headers=headers,
+                timeout=8,
+                allow_redirects=True
+            )
+            response.raise_for_status()
+            self.page_cache = response.text
+            self.page_last_fetch = now
+            print("✓ Fetched from Investing.com using requests")
+            return self.page_cache
+            
+        except Exception as e:
+            print(f"[Investing.com] Blocked ({str(e)[:80]}). Using Yahoo Finance fallback.")
+            return None
 
     def _parse_investing_tables(self, page_html: str, investing_name: str) -> Optional[Dict]:
         """Read Investing.com commodity rows with pandas when table parsers are available."""
@@ -74,35 +137,74 @@ class GlobalLiveData:
             return None
 
         for table in tables:
-            if "Name" not in table.columns or "Last" not in table.columns:
-                continue
+            # Try parsing standard format with columns like "Name", "Last", etc
+            if "Name" in table.columns and "Last" in table.columns:
+                rows = table[table["Name"].astype(str).str.contains(investing_name, case=False, regex=False)]
+                if not rows.empty:
+                    row = rows.iloc[0]
+                    price = self._parse_number(row.get("Last"))
+                    if price is None:
+                        continue
 
-            rows = table[table["Name"].astype(str).str.contains(investing_name, case=False, regex=False)]
-            if rows.empty:
-                continue
+                    previous = self._parse_number(row.get("Prev."))
+                    change = self._parse_number(row.get("Chg."))
+                    change_percent = self._parse_number(row.get("Chg. %"))
+                    if change is None and previous not in (None, 0):
+                        change = price - previous
+                    if change_percent is None and previous not in (None, 0):
+                        change_percent = (price - previous) / previous * 100
 
-            row = rows.iloc[0]
-            price = self._parse_number(row.get("Last"))
-            if price is None:
-                continue
+                    return {
+                        "price": price,
+                        "previous": previous,
+                        "high": self._parse_number(row.get("High")),
+                        "low": self._parse_number(row.get("Low")),
+                        "change": change or 0.0,
+                        "change_percent": change_percent or 0.0,
+                        "market_time": str(row.get("Time", "")).strip(),
+                    }
 
-            previous = self._parse_number(row.get("Prev."))
-            change = self._parse_number(row.get("Chg."))
-            change_percent = self._parse_number(row.get("Chg. %"))
-            if change is None and previous not in (None, 0):
-                change = price - previous
-            if change_percent is None and previous not in (None, 0):
-                change_percent = (price - previous) / previous * 100
-
-            return {
-                "price": price,
-                "previous": previous,
-                "high": self._parse_number(row.get("High")),
-                "low": self._parse_number(row.get("Low")),
-                "change": change or 0.0,
-                "change_percent": change_percent or 0.0,
-                "market_time": str(row.get("Time", "")).strip(),
-            }
+            # Try parsing compact format: [Name|Time, Price-Change-ChangePercent]
+            if len(table.columns) >= 2:
+                col0 = table.columns[0]
+                col1 = table.columns[1]
+                
+                for _, row in table.iterrows():
+                    try:
+                        name_cell = str(row.get(col0, ""))
+                        data_cell = str(row.get(col1, ""))
+                        
+                        # Check if name matches (e.g., "Gold23:41:44|GC")
+                        if investing_name.lower() not in name_cell.lower():
+                            continue
+                        
+                        # Parse price data: "4,547.75-10.25-0.22"
+                        parts = data_cell.replace(",", "").split("-")
+                        if len(parts) >= 3:
+                            price = self._parse_number(parts[0])
+                            if price is None:
+                                continue
+                            
+                            change = self._parse_number(parts[1])
+                            # Handle case where change might be negative
+                            if len(parts) > 2 and parts[2] and parts[2][0].isdigit():
+                                change_percent_str = parts[2]
+                            else:
+                                change_percent_str = None
+                            
+                            change_percent = self._parse_number(change_percent_str) if change_percent_str else 0.0
+                            
+                            return {
+                                "price": price,
+                                "previous": price + (change or 0) if change else price,
+                                "high": None,
+                                "low": None,
+                                "change": change or 0.0,
+                                "change_percent": change_percent or 0.0,
+                                "market_time": "",
+                            }
+                    except Exception:
+                        continue
 
         return None
 
@@ -152,7 +254,11 @@ class GlobalLiveData:
         }
 
     def get_investing_commodities_quote(self, ticker: str) -> Optional[Dict]:
-        """Get a live global commodity quote from Investing.com India."""
+        """Get a live global commodity quote from Investing.com India.
+        
+        Note: Investing.com has strong anti-scraping protection. This method will
+        return None and the system will fall back to Yahoo Finance automatically.
+        """
         mapping = self.TICKER_MAPPING.get(ticker, {})
         investing_name = mapping.get("investing_name")
         if not investing_name:
@@ -161,6 +267,7 @@ class GlobalLiveData:
         try:
             page_html = self._get_investing_html()
             if not page_html:
+                # Silently return None so fallback to Yahoo Finance happens
                 return None
 
             quote = (
@@ -184,12 +291,14 @@ class GlobalLiveData:
                 "source": "Investing.com India Commodities",
             }
         except Exception as e:
-            self.cache[f"{ticker}:investing_error"] = str(e)
+            # Silently fail so fallback happens
             return None
 
     def get_live_futures_quote(self, ticker: str) -> Optional[Dict]:
         """
         Get live futures quote with 1-second refresh capability.
+        
+        Attempts to fetch from Investing.com first, then falls back to Yahoo Finance.
 
         Args:
             ticker: Yahoo Finance ticker symbol
@@ -203,13 +312,39 @@ class GlobalLiveData:
             if ticker in self.cache and (now - self.last_fetch.get(ticker, 0)) < self.cache_timeout:
                 return self.cache[ticker]
 
+            # Try Investing.com first
             investing_quote = self.get_investing_commodities_quote(ticker)
             if investing_quote:
                 self.cache[ticker] = investing_quote
                 self.last_fetch[ticker] = now
                 return investing_quote
 
-            # Fetch fresh data
+            # Fallback to Yahoo Finance if Investing.com fails
+            return self._get_yfinance_fallback(ticker)
+
+        except Exception as e:
+            print(f"Error fetching global live data for {ticker}: {e}")
+            # Try Yahoo Finance as last resort even if exception occurred
+            try:
+                return self._get_yfinance_fallback(ticker)
+            except Exception as fallback_error:
+                print(f"Yahoo Finance fallback also failed for {ticker}: {fallback_error}")
+                return None
+
+    def _get_yfinance_fallback(self, ticker: str) -> Optional[Dict]:
+        """
+        Fallback to Yahoo Finance when Investing.com fails.
+        
+        Args:
+            ticker: Yahoo Finance ticker symbol
+            
+        Returns:
+            Dict with live price data or None if failed
+        """
+        try:
+            now = time.time()
+            
+            # Fetch fresh data from Yahoo Finance
             data = yf.download(ticker, period="1d", interval="1m", progress=False)
 
             if data.empty:
@@ -231,7 +366,7 @@ class GlobalLiveData:
                 "low": float(latest["Low"]),
                 "volume": int(latest["Volume"]) if "Volume" in data.columns else 0,
                 "timestamp": datetime.now(),
-                "source": "Yahoo Finance Live Fallback"
+                "source": "Yahoo Finance (Fallback)"
             }
 
             # Cache result
@@ -241,7 +376,7 @@ class GlobalLiveData:
             return result
 
         except Exception as e:
-            print(f"Error fetching global live data for {ticker}: {e}")
+            print(f"Yahoo Finance fallback failed for {ticker}: {e}")
             return None
 
     def get_live_options_quote(self, underlying: str, strike: float, option_type: str, expiry: str) -> Optional[Dict]:

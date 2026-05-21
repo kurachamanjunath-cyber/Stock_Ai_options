@@ -13,6 +13,8 @@ scipy
 transformers
 torch
 kiteconnect
+cloudscraper
+lxml
 
 # Optional: For live MCX/NSE options data via WebSocket
 # websocket-client>=1.0.0

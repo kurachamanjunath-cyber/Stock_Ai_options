@@ -34,49 +34,74 @@ def detect_candlestick_patterns(data: pd.DataFrame, close_col: str = "Close") ->
         current_pattern = None
         confidence = 0
         signal = "NEUTRAL"
+        pattern_direction = None
+        
+        # Calculate trend using simple moving averages
+        sma_10 = c[-10:].mean() if len(c) >= 10 else c.mean()
+        sma_20 = c[-20:].mean() if len(c) >= 20 else c.mean()
+        current_price = c[-1]
+        
+        # Determine overall trend
+        trend = "BULLISH" if sma_10 > sma_20 else "BEARISH" if sma_10 < sma_20 else "NEUTRAL"
         
         # ===== SINGLE CANDLE PATTERNS =====
         
-        # Hammer (Bullish reversal)
+        # Hammer (Bullish reversal - only valid in downtrend)
         if is_hammer(o[-1], h[-1], l[-1], c[-1]):
-            patterns.append(("HAMMER", "BULLISH", 75))
-            current_pattern = "HAMMER"
-            confidence = 75
-            signal = "BUY_CALL"
+            patterns.append(("HAMMER", "BULLISH_SIGNAL", 75))
+            pattern_direction = "BULLISH"
+            if trend != "BEARISH":  # Only trust hammer in downtrend or early recovery
+                current_pattern = "HAMMER"
+                confidence = 60
+                signal = "BUY_CALL"
         
-        # Inverted Hammer (Bearish reversal)
+        # Inverted Hammer (Bearish reversal - only valid in uptrend)
         elif is_inverted_hammer(o[-1], h[-1], l[-1], c[-1]):
-            patterns.append(("INVERTED_HAMMER", "BEARISH", 70))
-            current_pattern = "INVERTED_HAMMER"
-            confidence = 70
-            signal = "BUY_PUT"
+            patterns.append(("INVERTED_HAMMER", "BEARISH_SIGNAL", 70))
+            pattern_direction = "BEARISH"
+            if trend != "BULLISH":  # Only trust in uptrend or early reversal
+                current_pattern = "INVERTED_HAMMER"
+                confidence = 60
+                signal = "BUY_PUT"
         
         # Doji (Indecision)
         elif is_doji(o[-1], h[-1], l[-1], c[-1]):
             patterns.append(("DOJI", "NEUTRAL", 60))
             current_pattern = "DOJI"
-            confidence = 60
+            confidence = 50
             signal = "WAIT"
         
         # Spinning Top (Indecision)
         elif is_spinning_top(o[-1], h[-1], l[-1], c[-1]):
             patterns.append(("SPINNING_TOP", "NEUTRAL", 50))
             current_pattern = "SPINNING_TOP"
-            confidence = 50
+            confidence = 45
             signal = "WAIT"
         
-        # Marubozu (Strong bullish/bearish)
+        # Marubozu (Strong bullish/bearish) - ONLY IN TREND DIRECTION
         elif is_marubozu_bullish(o[-1], h[-1], l[-1], c[-1]):
-            patterns.append(("MARUBOZU_BULLISH", "BULLISH", 85))
-            current_pattern = "MARUBOZU_BULLISH"
-            confidence = 85
-            signal = "BUY_CALL"
+            patterns.append(("MARUBOZU_BULLISH", "BULLISH_SIGNAL", 85))
+            pattern_direction = "BULLISH"
+            if trend == "BULLISH":  # Confirm with trend
+                current_pattern = "MARUBOZU_BULLISH"
+                confidence = 85
+                signal = "BUY_CALL"
+            else:
+                current_pattern = "MARUBOZU_BULLISH"
+                confidence = 50
+                signal = "WAIT"
         
         elif is_marubozu_bearish(o[-1], h[-1], l[-1], c[-1]):
-            patterns.append(("MARUBOZU_BEARISH", "BEARISH", 85))
-            current_pattern = "MARUBOZU_BEARISH"
-            confidence = 85
-            signal = "BUY_PUT"
+            patterns.append(("MARUBOZU_BEARISH", "BEARISH_SIGNAL", 85))
+            pattern_direction = "BEARISH"
+            if trend == "BEARISH":  # Confirm with trend
+                current_pattern = "MARUBOZU_BEARISH"
+                confidence = 85
+                signal = "BUY_PUT"
+            else:
+                current_pattern = "MARUBOZU_BEARISH"
+                confidence = 50
+                signal = "WAIT"
         
         # ===== TWO CANDLE PATTERNS =====
         
@@ -87,9 +112,16 @@ def detect_candlestick_patterns(data: pd.DataFrame, close_col: str = "Close") ->
                 pattern_name, direction, conf = engulf_result
                 patterns.append((pattern_name, direction, conf))
                 if not current_pattern:
-                    current_pattern = pattern_name
-                    confidence = conf
-                    signal = "BUY_CALL" if direction == "BULLISH" else "BUY_PUT"
+                    # Bullish engulfing only valid if price below SMA or in recovery
+                    if direction == "BULLISH" and current_price > sma_20:
+                        current_pattern = pattern_name
+                        confidence = conf
+                        signal = "BUY_CALL"
+                    # Bearish engulfing only valid if price above SMA or in decline
+                    elif direction == "BEARISH" and current_price < sma_20:
+                        current_pattern = pattern_name
+                        confidence = conf
+                        signal = "BUY_PUT"
             
             # Harami Pattern (Reversal)
             harami_result = is_harami(o[-2], c[-2], o[-1], h[-1], l[-1], c[-1])
@@ -100,18 +132,18 @@ def detect_candlestick_patterns(data: pd.DataFrame, close_col: str = "Close") ->
         # ===== THREE CANDLE PATTERNS =====
         
         if len(data) >= 3:
-            # Morning Star (Bullish reversal)
+            # Morning Star (Bullish reversal - at bottoms)
             if is_morning_star(o, h, l, c):
                 patterns.append(("MORNING_STAR", "BULLISH", 80))
-                if not current_pattern:
+                if not current_pattern and current_price > sma_20:
                     current_pattern = "MORNING_STAR"
                     confidence = 80
                     signal = "BUY_CALL"
             
-            # Evening Star (Bearish reversal)
+            # Evening Star (Bearish reversal - at tops)
             elif is_evening_star(o, h, l, c):
                 patterns.append(("EVENING_STAR", "BEARISH", 80))
-                if not current_pattern:
+                if not current_pattern and current_price < sma_20:
                     current_pattern = "EVENING_STAR"
                     confidence = 80
                     signal = "BUY_PUT"
@@ -124,7 +156,7 @@ def detect_candlestick_patterns(data: pd.DataFrame, close_col: str = "Close") ->
                 patterns.append(("HIGHER_HIGHS_LOWS", "BULLISH", 70))
                 if not current_pattern:
                     current_pattern = "HIGHER_HIGHS_LOWS"
-                    confidence = 70
+                    confidence = 75
                     signal = "BUY_CALL"
             
             # Lower Highs & Lower Lows (Downtrend)
@@ -132,14 +164,30 @@ def detect_candlestick_patterns(data: pd.DataFrame, close_col: str = "Close") ->
                 patterns.append(("LOWER_HIGHS_LOWS", "BEARISH", 70))
                 if not current_pattern:
                     current_pattern = "LOWER_HIGHS_LOWS"
-                    confidence = 70
+                    confidence = 75
                     signal = "BUY_PUT"
+        
+        # If still no clear signal, use trend as fallback
+        if signal == "NEUTRAL" and not current_pattern:
+            if trend == "BULLISH":
+                current_pattern = "TREND_FOLLOWING"
+                confidence = 65
+                signal = "BUY_CALL"
+            elif trend == "BEARISH":
+                current_pattern = "TREND_FOLLOWING"
+                confidence = 65
+                signal = "BUY_PUT"
+            else:
+                current_pattern = "NO_PATTERN"
+                confidence = 0
+                signal = "WAIT"
         
         return {
             "patterns": patterns,
             "current_pattern": current_pattern or "NO_PATTERN",
             "confidence": confidence,
             "signal": signal,
+            "trend": trend,
             "current_close": float(c[-1]),
             "current_high": float(h[-1]),
             "current_low": float(l[-1])
@@ -151,6 +199,7 @@ def detect_candlestick_patterns(data: pd.DataFrame, close_col: str = "Close") ->
             "current_pattern": "ERROR",
             "confidence": 0,
             "signal": "HOLD",
+            "trend": "UNKNOWN",
             "error": str(e)
         }
 
